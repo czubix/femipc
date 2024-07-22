@@ -18,14 +18,14 @@ import asyncio, socket, select, threading, pickle, struct, os, logging
 
 from enum import Enum
 
-from typing import List, Dict, Callable, Awaitable, Any
+from typing import List, Dict, Optional, Callable, Awaitable, Any
 
 class Opcodes(Enum):
     EMIT = 0
     RESPONSE = 1
 
 class SocketReader(threading.Thread):
-    def __init__(self, socket: socket.socket, *, loop: asyncio.AbstractEventLoop = None) -> None:
+    def __init__(self, socket: socket.socket, *, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
         super().__init__(daemon=True, name=f"SocketReader:{id(self):#x}")
 
         self.loop = loop or asyncio.get_event_loop()
@@ -65,8 +65,33 @@ class SocketReader(threading.Thread):
             else:
                 self.loop.call_soon_threadsafe(self.queue.put_nowait, (event, data))
 
+CallbackType = Callable[..., Awaitable[None]]
+
+MISSING = Any
+
+class Listener:
+    def __init__(self, event: str, callback: CallbackType) -> None:
+        self.__name__ = event
+        self.event = event
+        self.callback = callback
+        self.client: Client = MISSING
+
+    def __str__(self) -> str:
+        return f"{self.callback!r}"
+
+    def __repr__(self) -> str:
+        return f"{self.callback!r}"
+
+    async def __call__(self, *args) -> None:
+        await self.callback(self.client, *args)
+
+def listener(event: str) -> Callable[[CallbackType], Listener]:
+    def wrapper(func: CallbackType) -> Listener:
+        return Listener(event, func)
+    return wrapper
+
 class Client:
-    def __init__(self, path: str, peers: List[str] = None, loop: asyncio.AbstractEventLoop = None) -> None:
+    def __init__(self, path: str, peers: Optional[List[str]] = None, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
         self.loop = loop or asyncio.get_event_loop()
 
         if os.path.exists(path):
@@ -84,10 +109,19 @@ class Client:
 
         self.receiver = self.loop.create_task(self._receiver())
 
-        self.events: Dict[str, List[Callable[[Any], Awaitable[None]]]] = {}
+        self.events: Dict[str, List[CallbackType]] = {}
 
-    def on[T, U](self, event: str, *, func: U = None) -> Callable[[T], object]:
-        def wrapper[U](func: T) -> U:
+        for attr in self.__dir__():
+            attr = getattr(self, attr)
+            if isinstance(attr, Listener):
+                attr: Listener
+                attr.client = self
+                if not attr.event in self.events:
+                    self.events[attr.event] = []
+                self.events[attr.event].append(attr)
+
+    def on(self, event: str, *, func: Optional[CallbackType] = None) -> Callable[[CallbackType], CallbackType]:
+        def wrapper(func: CallbackType) -> CallbackType:
             if event not in self.events:
                 self.events[event] = []
             self.events[event].append(func)
