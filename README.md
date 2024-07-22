@@ -1,11 +1,11 @@
 # Description:
-A simple async IPC library that is perfect for discord bots and more
+A simple async IPC library made with discord bots in mind
 
 # Installation:
 
 ```bash
 $ git clone https://github.com/czubix/femipc.git
-$ cd scheduler
+$ cd femipc
 $ python3 -m pip install -U .
 ```
 
