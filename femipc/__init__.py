@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import asyncio, socket, select, threading, pickle, struct, os, logging
+import asyncio, socket, select, threading, pickle, struct, uuid, os, logging
 
 from enum import Enum
 
-from typing import List, Dict, Optional, Callable, Awaitable, Any
+from typing import List, Dict, Tuple, Optional, Callable, Awaitable, Any
 
 class Opcodes(Enum):
     EMIT = 0
@@ -39,8 +39,8 @@ class SocketReader(threading.Thread):
     def stop(self) -> None:
         self._end.set()
 
-    def get_packet[T](self, opcode: Opcodes, event: str, data: bytes) -> bytes:
-        return struct.pack("HHI", opcode.value, len(event), len(data))
+    def get_packet(self, opcode: Opcodes, nonce: bytes, event: str, data: bytes) -> bytes:
+        return struct.pack("H16sHI", opcode.value, nonce, len(event), len(data))
 
     def run(self) -> None:
         while not self._end.is_set():
@@ -53,8 +53,8 @@ class SocketReader(threading.Thread):
                 continue
 
             try:
-                data = self.socket.recv(8)
-                opcode, event_length, data_length = struct.unpack("HHI", data)
+                data = self.socket.recv(24)
+                opcode, nonce, event_length, data_length = struct.unpack("H16sHI", data)
                 opcode = Opcodes(opcode)
 
                 data = self.socket.recv(event_length + data_length)
@@ -63,9 +63,9 @@ class SocketReader(threading.Thread):
             except OSError:
                 continue
             else:
-                self.loop.call_soon_threadsafe(self.queue.put_nowait, (event, data))
+                self.loop.call_soon_threadsafe(self.queue.put_nowait, (opcode, nonce, event, data))
 
-CallbackType = Callable[..., Awaitable[None]]
+CallbackType = Callable[..., Awaitable[Any]]
 
 MISSING = Any
 
@@ -82,8 +82,8 @@ class Listener:
     def __repr__(self) -> str:
         return f"{self.callback!r}"
 
-    async def __call__(self, *args) -> None:
-        await self.callback(self.client, *args)
+    async def __call__(self, *args) -> Any:
+        return await self.callback(self.client, *args)
 
 def listener(event: str) -> Callable[[CallbackType], Listener]:
     def wrapper(func: CallbackType) -> Listener:
@@ -110,6 +110,7 @@ class Client:
         self.receiver = self.loop.create_task(self._receiver())
 
         self.events: Dict[str, List[CallbackType]] = {}
+        self.futures: Dict[bytes, asyncio.Future] = {}
 
         for attr in self.__dir__():
             attr = getattr(self, attr)
@@ -140,19 +141,37 @@ class Client:
             raise Exception("Peer not found")
         self.peers.remove(peer)
 
-    async def emit(self, event: str, *args) -> None:
-        data = pickle.dumps(args) if args else b""
+    async def send_packet(self, opcode: Opcodes, nonce: bytes, event: str, args: Tuple[Any]) -> None:
+        data = pickle.dumps(args)
 
         for peer in self.peers:
             try:
-                await self.loop.sock_sendto(self.socket, self.reader.get_packet(Opcodes.EMIT, event, data), peer)
+                await self.loop.sock_sendto(self.socket, self.reader.get_packet(opcode, nonce, event, data), peer)
                 await self.loop.sock_sendto(self.socket, event.encode() + data, peer)
             except ConnectionRefusedError:
                 logging.debug("peer %s is unavailable" % peer)
 
+    async def emit(self, event: str, *args, nowait: bool = False) -> Any:
+        nonce = uuid.uuid4().bytes
+        if not nowait:
+            future = self.loop.create_future()
+            self.futures[nonce] = future
+
+        await self.send_packet(Opcodes.EMIT, nonce, event, args)
+
+        if not nowait:
+            return await asyncio.wait_for(future, 10)
+
     async def _receiver(self) -> None:
         while True:
-            event, data = await self.reader.queue.get()
+            opcode, nonce, event, data = await self.reader.queue.get()
+
+            if opcode is Opcodes.RESPONSE:
+                future = self.futures.get(nonce)
+                if future:
+                    logging.debug("received %s response" % event)
+                    future.set_result(pickle.loads(data))
+                continue
 
             if event not in self.events:
                 logging.debug("event %s not found" % event)
@@ -162,7 +181,8 @@ class Client:
 
             for func in self.events[event]:
                 try:
-                    await func(*(pickle.loads(data) if data else ()))
+                    result = await func(*(pickle.loads(data) if data else ()))
+                    await self.send_packet(Opcodes.RESPONSE, nonce, event, result)
                 except Exception as error:
                     logging.error(error)
 

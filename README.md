@@ -23,13 +23,13 @@ async def event_example() -> None:
     client = Client("/tmp/bot", ["/tmp/server"])
 
     @client.on("add_role")
-    async def on_add_role(guild_id: int, user_id: int, role_id: int):
+    async def on_add_role(guild_id: int, user_id: int, role_id: int) -> None:
         ...
 
 async def emit_example() -> None:
     client = Client("/tmp/server", ["/tmp/bot"])
 
-    await client.emit("add_role", guild_id, user_id, role_id)
+    await client.emit("add_role", guild_id, user_id, role_id, nowait=True)
 ```
 ```py
 from femipc import Client. listener
@@ -40,7 +40,17 @@ class IPC(Client):
     def __init__(self, path: str, peers: List[str]) -> None:
         super().__init__(path, peers)
 
-    @listener("echo")
-    async def on_test(self, *args):
-        await self.emit("echo", *args)
+    @listener("add")
+    async def on_test(self, arg1: int, arg2: int) -> int:
+        return arg1 + arg2
+
+async def example() -> None:
+    client = IPC("example1", ["example2"])
+
+async def receive_example() -> None:
+    client = Client("example2", ["example1"])
+
+    result = await client.emit("add", 6, 9)
+
+    assert result == 5
 ```
