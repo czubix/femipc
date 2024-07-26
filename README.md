@@ -41,7 +41,7 @@ class IPC(Client):
         super().__init__(path, peers)
 
     @listener("add")
-    async def on_test(self, arg1: int, arg2: int) -> int:
+    async def on_add(self, arg1: int, arg2: int) -> int:
         return arg1 + arg2
 
 async def example() -> None:
@@ -52,5 +52,5 @@ async def receive_example() -> None:
 
     result = await client.emit("add", 6, 9)
 
-    assert result == 5
+    assert result == 15
 ```

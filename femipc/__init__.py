@@ -39,9 +39,6 @@ class SocketReader(threading.Thread):
     def stop(self) -> None:
         self._end.set()
 
-    def get_packet(self, opcode: Opcodes, nonce: bytes, event: str, data: bytes) -> bytes:
-        return struct.pack("H16sHI", opcode.value, nonce, len(event), len(data))
-
     def run(self) -> None:
         while not self._end.is_set():
             try:
@@ -53,17 +50,19 @@ class SocketReader(threading.Thread):
                 continue
 
             try:
-                data = self.socket.recv(24)
-                opcode, nonce, event_length, data_length = struct.unpack("H16sHI", data)
-                opcode = Opcodes(opcode)
+                data = self.socket.recv(8)
+                event_length, data_length = struct.unpack("<II", data)
 
-                data = self.socket.recv(event_length + data_length)
-                event = data[:event_length].decode()
-                data = data[event_length:]
+                data = self.socket.recv(1 + 1 + 16 + event_length + data_length)
+                opcode = Opcodes(data[0])
+                nowait = bool(data[1])
+                nonce = data[2:18]
+                event = data[18:18+event_length].decode()
+                data = data[18+event_length:]
             except OSError:
                 continue
             else:
-                self.loop.call_soon_threadsafe(self.queue.put_nowait, (opcode, nonce, event, data))
+                self.loop.call_soon_threadsafe(self.queue.put_nowait, (opcode, nowait, nonce, event, data))
 
 CallbackType = Callable[..., Awaitable[Any]]
 
@@ -141,15 +140,17 @@ class Client:
             raise Exception("Peer not found")
         self.peers.remove(peer)
 
-    async def send_packet(self, opcode: Opcodes, nonce: bytes, event: str, args: Tuple[Any]) -> None:
+    async def send_packet(self, opcode: Opcodes, nowait: bool, nonce: bytes, event: str, args: Tuple[Any]) -> None:
         data = pickle.dumps(args)
 
         for peer in self.peers:
             try:
-                await self.loop.sock_sendto(self.socket, self.reader.get_packet(opcode, nonce, event, data), peer)
-                await self.loop.sock_sendto(self.socket, event.encode() + data, peer)
+                await self.loop.sock_sendto(self.socket, struct.pack("<II", len(event), len(data)), peer)
+                await self.loop.sock_sendto(self.socket, opcode.value.to_bytes() + nowait.to_bytes() + nonce + event.encode() + data, peer)
             except ConnectionRefusedError:
                 logging.debug("peer %s is unavailable" % peer)
+
+        logging.debug("sent %s %s%s" % (event, "nowait " if nowait and opcode is Opcodes.EMIT else "", "event" if opcode is Opcodes.EMIT else "response"))
 
     async def emit(self, event: str, *args, nowait: bool = False) -> Any:
         nonce = uuid.uuid4().bytes
@@ -157,14 +158,14 @@ class Client:
             future = self.loop.create_future()
             self.futures[nonce] = future
 
-        await self.send_packet(Opcodes.EMIT, nonce, event, args)
+        await self.send_packet(Opcodes.EMIT, nowait, nonce, event, args)
 
         if not nowait:
             return await asyncio.wait_for(future, 10)
 
     async def _receiver(self) -> None:
         while True:
-            opcode, nonce, event, data = await self.reader.queue.get()
+            opcode, nowait, nonce, event, data = await self.reader.queue.get()
 
             if opcode is Opcodes.RESPONSE:
                 future = self.futures.get(nonce)
@@ -182,7 +183,8 @@ class Client:
             for func in self.events[event]:
                 try:
                     result = await func(*(pickle.loads(data) if data else ()))
-                    await self.send_packet(Opcodes.RESPONSE, nonce, event, result)
+                    if not nowait:
+                        await self.send_packet(Opcodes.RESPONSE, True, nonce, event, result)
                 except Exception as error:
                     logging.error(error)
 
