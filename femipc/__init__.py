@@ -1,5 +1,5 @@
 """
-Copyright 2023-2024 czubix
+Copyright 2023-2025 czubix
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,23 +14,113 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import asyncio, socket, select, threading, pickle, struct, uuid, os, logging
+import asyncio
+import threading
+import pickle
+import struct
+import uuid
+import os
+import logging
 
 from enum import Enum
 
-from typing import List, Dict, Tuple, Optional, Callable, Awaitable, Any
+from typing import Optional, Callable, Awaitable, Any, NoReturn
+
+if os.name == "nt":
+    import win32pipe # noqa: F401
+    import win32file # noqa: F401
+    import pywintypes # noqa: F401
+elif os.name == "posix":
+    import socket
+    import select
 
 class Opcodes(Enum):
     EMIT = 0
     RESPONSE = 1
 
-class SocketReader(threading.Thread):
-    def __init__(self, socket: socket.socket, *, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
-        super().__init__(daemon=True, name=f"SocketReader:{id(self):#x}")
+class CommunicatorReadError(Exception):
+    pass
+
+class CommunicatorWriteError(Exception):
+    pass
+
+class Communicator:
+    def __init__(self, path: str, *, loop: Optional[asyncio.AbstractEventLoop] = None) -> NoReturn:
+        raise NotImplementedError
+
+    async def send_to(self, data: bytes, path: str) -> NoReturn:
+        raise NotImplementedError
+
+    def recv(self, size: int) -> NoReturn:
+        raise NotImplementedError
+
+    def can_read(self) -> NoReturn:
+        raise NotImplementedError
+
+    def close(self) -> NoReturn:
+        raise NotImplementedError
+
+class WindowsCommunicator(Communicator):
+    def __init__(self, path: str, *, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
+        self.loop = loop or asyncio.get_event_loop()
+
+    async def sendto(self, data: bytes, path: str) -> None:
+        pass
+
+    def recv(self, size: int) -> bytes:
+        pass
+
+    def can_read(self) -> bool:
+        return True
+
+    def close(self) -> None:
+        pass
+
+class PosixCommunicator(Communicator):
+    def __init__(self, path: str, *, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
+        if os.path.exists(path):
+            os.remove(path)
 
         self.loop = loop or asyncio.get_event_loop()
 
-        self.socket = socket
+        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.socket.setblocking(True)
+        self.socket.bind(path)
+
+    async def sendto(self, data: bytes, path: str) -> None:
+        try:
+            for chunk in [data[i:i+65507] for i in range(0, len(data), 65507)]:
+                await self.loop.sock_sendto(self.socket, chunk, path)
+        except ConnectionRefusedError as exc:
+            raise CommunicatorWriteError from exc
+
+    def recv(self, size: int) -> bytes:
+        try:
+            return self.socket.recv(size)
+        except (socket.error, OSError) as exc:
+            raise CommunicatorReadError from exc
+
+    def can_read(self) -> bool:
+        try:
+            readable, _, _ = select.select([self.socket], [], [])
+        except (ValueError, TypeError, OSError):
+            return False
+
+        if not readable:
+            return False
+
+        return True
+
+    def close(self) -> None:
+        self.socket.close()
+
+class Reader(threading.Thread):
+    def __init__(self, communicator: WindowsCommunicator | PosixCommunicator, *, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
+        super().__init__(daemon=True, name=f"Reader:{id(self):#x}")
+
+        self.loop = loop or asyncio.get_event_loop()
+
+        self.communicator = communicator
 
         self._end = threading.Event()
 
@@ -41,25 +131,28 @@ class SocketReader(threading.Thread):
 
     def run(self) -> None:
         while not self._end.is_set():
-            try:
-                readable, _, _ = select.select([self.socket], [], [], 30)
-            except (ValueError, TypeError, OSError):
-                continue
-
-            if not readable:
+            if not self.communicator.can_read():
                 continue
 
             try:
-                data = self.socket.recv(8)
+                data = self.communicator.recv(8)
                 event_length, data_length = struct.unpack("<II", data)
 
-                data = self.socket.recv(1 + 1 + 16 + event_length + data_length)
+                length = 1 + 1 + 16 + event_length + data_length
+
+                chunks, remainder = divmod(length, 65507)
+                chunks = [65507] * chunks + ([remainder] if remainder > 0 else [])
+
+                data = self.communicator.recv(chunks[0])
                 opcode = Opcodes(data[0])
                 nowait = bool(data[1])
                 nonce = data[2:18]
                 event = data[18:18+event_length].decode()
                 data = data[18+event_length:]
-            except OSError:
+
+                for chunk in chunks[1:]:
+                    data += self.communicator.recv(chunk)
+            except CommunicatorReadError:
                 continue
             else:
                 self.loop.call_soon_threadsafe(self.queue.put_nowait, (opcode, nowait, nonce, event, data))
@@ -90,33 +183,32 @@ def listener(event: str) -> Callable[[CallbackType], Listener]:
     return wrapper
 
 class Client:
-    def __init__(self, path: str, peers: Optional[List[str]] = None, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
+    def __init__(self, path: str, peers: Optional[list[str]] = None, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
         self.loop = loop or asyncio.get_event_loop()
 
-        if os.path.exists(path):
-            os.remove(path)
-
-        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        self.socket.setblocking(False)
-        self.socket.bind(path)
-        
         self.path = path
-        self.peers: List[str] = peers or []
+        self.peers: list[str] = peers or []
 
-        self.reader = SocketReader(self.socket)
+        if os.name == "nt":
+            self.peers.append(self.path)
+            self.communicator = WindowsCommunicator(path)
+        elif os.name == "posix":
+            self.communicator = PosixCommunicator(path)
+
+        self.reader = Reader(self.communicator)
         self.reader.start()
 
         self.receiver = self.loop.create_task(self._receiver())
 
-        self.events: Dict[str, List[CallbackType]] = {}
-        self.futures: Dict[bytes, asyncio.Future] = {}
+        self.events: dict[str, list[CallbackType]] = {}
+        self.futures: dict[bytes, asyncio.Future] = {}
 
         for attr in self.__dir__():
             attr = getattr(self, attr)
             if isinstance(attr, Listener):
                 attr: Listener
                 attr.client = self
-                if not attr.event in self.events:
+                if attr.event not in self.events:
                     self.events[attr.event] = []
                 self.events[attr.event].append(attr)
 
@@ -140,14 +232,14 @@ class Client:
             raise Exception("Peer not found")
         self.peers.remove(peer)
 
-    async def send_packet(self, opcode: Opcodes, nowait: bool, nonce: bytes, event: str, args: Tuple[Any]) -> None:
+    async def send_packet(self, opcode: Opcodes, nowait: bool, nonce: bytes, event: str, args: tuple[Any]) -> None:
         data = pickle.dumps(args)
 
         for peer in self.peers:
             try:
-                await self.loop.sock_sendto(self.socket, struct.pack("<II", len(event), len(data)), peer)
-                await self.loop.sock_sendto(self.socket, opcode.value.to_bytes() + nowait.to_bytes() + nonce + event.encode() + data, peer)
-            except ConnectionRefusedError:
+                await self.communicator.sendto(struct.pack("<II", len(event), len(data)), peer)
+                await self.communicator.sendto(opcode.value.to_bytes() + nowait.to_bytes() + nonce + event.encode() + data, peer)
+            except CommunicatorWriteError:
                 logging.debug("peer %s is unavailable" % peer)
 
         logging.debug("sent %s %s%s" % (event, "nowait " if nowait and opcode is Opcodes.EMIT else "", "event" if opcode is Opcodes.EMIT else "response"))
@@ -185,11 +277,10 @@ class Client:
                     result = await func(*(pickle.loads(data) if data else ()))
                     if not nowait:
                         await self.send_packet(Opcodes.RESPONSE, True, nonce, event, result)
-                except Exception as error:
-                    logging.error(error)
+                except Exception as exc:
+                    logging.error(exc)
 
     def close(self) -> None:
         self.receiver.cancel()
         self.reader.stop()
-        self.socket.close()
-        os.remove(self.path)
+        self.communicator.close()
